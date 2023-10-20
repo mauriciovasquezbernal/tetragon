@@ -4,6 +4,7 @@
 package namespace
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,30 +12,42 @@ import (
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
 	"github.com/cilium/tetragon/pkg/api/processapi"
+	"github.com/cilium/tetragon/pkg/kernels"
 	"github.com/cilium/tetragon/pkg/logger"
 	"github.com/cilium/tetragon/pkg/option"
 )
 
-var hostNamespace *tetragon.Namespaces
+var (
+	listNamespaces = [10]string{"uts", "ipc", "mnt", "pid", "pid_for_children", "net", "time", "time_for_children", "cgroup", "user"}
+	// Host namespaces
+	knownNamespaces = make(map[string]*tetragon.Namespace)
+	hostNamespaces  *tetragon.Namespaces
 
-func GetPidNsInode(pid uint32, nsStr string) uint32 {
+	// If kernel supports time namespace
+	TimeNsSupport bool
+)
+
+// GetPidNsInode() returns the inode of the target namespace pointed by pid.
+// Returns:
+//
+//	namespace inode and nil on success
+//	0 and error on failures.
+func GetPidNsInode(pid uint32, nsStr string) (uint32, error) {
 	pidStr := strconv.Itoa(int(pid))
 	netns := filepath.Join(option.Config.ProcFS, pidStr, "ns", nsStr)
 	netStr, err := os.Readlink(netns)
 	if err != nil {
-		logger.GetLogger().WithError(err).Warn("GetPidNsInode")
-		return 0
+		return 0, fmt.Errorf("namespace '%s' %v", netns, err)
 	}
 	fields := strings.Split(netStr, ":")
 	if len(fields) < 2 {
-		logger.GetLogger().Errorf("GetPidNsInode: Error cannot parse %s\n", netStr)
-		return 0
+		return 0, fmt.Errorf("parsing namespace '%s' fields", netns)
 	}
 	inode := fields[1]
 	inode = strings.TrimRight(inode, "]")
 	inode = strings.TrimLeft(inode, "[")
 	inodeEntry, _ := strconv.ParseUint(inode, 10, 32)
-	return uint32(inodeEntry)
+	return uint32(inodeEntry), nil
 }
 
 func GetMyPidG() uint32 {
@@ -61,63 +74,71 @@ func GetMyPidG() uint32 {
 	return uint32(os.Getpid())
 }
 
-func GetHostNsInode(nsStr string) uint32 {
+func GetHostNsInode(nsStr string) (uint32, error) {
 	return GetPidNsInode(1, nsStr)
 }
 
-func GetSelfNsInode(nsStr string) uint32 {
+func GetSelfNsInode(nsStr string) (uint32, error) {
 	return GetPidNsInode(uint32(GetMyPidG()), nsStr)
 }
 
 func GetCurrentNamespace() *tetragon.Namespaces {
-	nses := [10]string{"uts", "ipc", "mnt", "pid", "pid_for_children", "net", "time", "time_for_children", "cgroup", "user"}
+	_, err := InitHostNamespace()
+	if err != nil {
+		return nil
+	}
 	self_ns := make(map[string]uint32)
-	is_root_ns := make(map[string]bool)
-	for i := 0; i < len(nses); i++ {
-		self_ns[nses[i]] = GetSelfNsInode(nses[i])
-		is_root_ns[nses[i]] = (self_ns[nses[i]] == GetHostNsInode(nses[i]))
+	for i := 0; i < len(listNamespaces); i++ {
+		ino, err := GetSelfNsInode(listNamespaces[i])
+		if err != nil {
+			logger.GetLogger().WithError(err).Warnf("Failed to read current namespace")
+			continue
+		}
+		self_ns[listNamespaces[i]] = ino
 	}
 
 	retVal := &tetragon.Namespaces{
 		Uts: &tetragon.Namespace{
 			Inum:   self_ns["uts"],
-			IsHost: is_root_ns["uts"],
+			IsHost: self_ns["uts"] == knownNamespaces["uts"].Inum,
 		},
 		Ipc: &tetragon.Namespace{
 			Inum:   self_ns["ipc"],
-			IsHost: is_root_ns["ipc"],
+			IsHost: self_ns["ipc"] == knownNamespaces["ipc"].Inum,
 		},
 		Mnt: &tetragon.Namespace{
 			Inum:   self_ns["mnt"],
-			IsHost: is_root_ns["mnt"],
+			IsHost: self_ns["mnt"] == knownNamespaces["mnt"].Inum,
 		},
 		Pid: &tetragon.Namespace{
 			Inum:   self_ns["pid"],
-			IsHost: is_root_ns["pid"],
+			IsHost: self_ns["pid"] == knownNamespaces["pid"].Inum,
 		},
 		PidForChildren: &tetragon.Namespace{
 			Inum:   self_ns["pid_for_children"],
-			IsHost: is_root_ns["pid_for_children"],
+			IsHost: self_ns["pid_for_children"] == knownNamespaces["pid_for_children"].Inum,
 		},
 		Net: &tetragon.Namespace{
 			Inum:   self_ns["net"],
-			IsHost: is_root_ns["net"],
+			IsHost: self_ns["net"] == knownNamespaces["net"].Inum,
 		},
 		Time: &tetragon.Namespace{
-			Inum:   self_ns["time"],
-			IsHost: is_root_ns["time"],
+			Inum: self_ns["time"],
+			// this kernel does not support time namespace
+			IsHost: knownNamespaces["time"].Inum != 0 && self_ns["time"] == knownNamespaces["time"].Inum,
 		},
 		TimeForChildren: &tetragon.Namespace{
-			Inum:   self_ns["time_for_children"],
-			IsHost: is_root_ns["time_for_children"],
+			Inum: self_ns["time_for_children"],
+			// this kernel does not support time namespace
+			IsHost: knownNamespaces["time_for_children"].Inum != 0 && self_ns["time_for_children"] == knownNamespaces["time_for_children"].Inum,
 		},
 		Cgroup: &tetragon.Namespace{
 			Inum:   self_ns["cgroup"],
-			IsHost: is_root_ns["cgroup"],
+			IsHost: self_ns["cgroup"] == knownNamespaces["cgroup"].Inum,
 		},
 		User: &tetragon.Namespace{
 			Inum:   self_ns["user"],
-			IsHost: is_root_ns["user"],
+			IsHost: self_ns["user"] == knownNamespaces["user"].Inum,
 		},
 	}
 
@@ -129,8 +150,12 @@ func GetCurrentNamespace() *tetragon.Namespaces {
 
 	return retVal
 }
-func GetMsgNamespaces(ns processapi.MsgNamespaces) *tetragon.Namespaces {
-	hostNs := GetHostNamespace()
+
+func GetMsgNamespaces(ns processapi.MsgNamespaces) (*tetragon.Namespaces, error) {
+	hostNs, err := InitHostNamespace()
+	if err != nil {
+		return nil, err
+	}
 	retVal := &tetragon.Namespaces{
 		Uts: &tetragon.Namespace{
 			Inum:   ns.UtsInum,
@@ -157,12 +182,14 @@ func GetMsgNamespaces(ns processapi.MsgNamespaces) *tetragon.Namespaces {
 			IsHost: hostNs.Net.Inum == ns.NetInum,
 		},
 		Time: &tetragon.Namespace{
-			Inum:   ns.TimeInum,
-			IsHost: hostNs.Time.Inum == ns.TimeInum,
+			Inum: ns.TimeInum,
+			// this kernel does not support time namespace
+			IsHost: hostNs.Time.Inum != 0 && hostNs.Time.Inum == ns.TimeInum,
 		},
 		TimeForChildren: &tetragon.Namespace{
-			Inum:   ns.TimeChildInum,
-			IsHost: hostNs.TimeForChildren.Inum == ns.TimeChildInum,
+			Inum: ns.TimeChildInum,
+			// this kernel does not support time namespace
+			IsHost: hostNs.TimeForChildren.Inum != 0 && hostNs.TimeForChildren.Inum == ns.TimeChildInum,
 		},
 		Cgroup: &tetragon.Namespace{
 			Inum:   ns.CgroupInum,
@@ -180,30 +207,49 @@ func GetMsgNamespaces(ns processapi.MsgNamespaces) *tetragon.Namespaces {
 		retVal.TimeForChildren = nil
 	}
 
-	return retVal
+	return retVal, nil
 }
 
-func GetHostNamespace() *tetragon.Namespaces {
-	if hostNamespace == nil {
-		hostNamespace = &tetragon.Namespaces{
-			Uts:             createHostNs("uts"),
-			Ipc:             createHostNs("ipc"),
-			Mnt:             createHostNs("mnt"),
-			Pid:             createHostNs("pid"),
-			PidForChildren:  createHostNs("pid_for_children"),
-			Net:             createHostNs("net"),
-			Time:            createHostNs("time"),
-			TimeForChildren: createHostNs("time_for_children"),
-			Cgroup:          createHostNs("cgroup"),
-			User:            createHostNs("user"),
+func InitHostNamespace() (*tetragon.Namespaces, error) {
+	if hostNamespaces != nil {
+		return hostNamespaces, nil
+	}
+
+	kernelVer, _, _ := kernels.GetKernelVersion(option.Config.KernelVersion, option.Config.ProcFS)
+	// time and time_for_children namespaces introduced in kernel 5.6
+	TimeNsSupport = (int64(kernelVer) >= kernels.KernelStringToNumeric("5.6.0"))
+
+	if TimeNsSupport == false {
+		logger.GetLogger().Infof("Kernel version %s doesn't support time namespaces", kernelVer)
+	}
+
+	for _, n := range listNamespaces {
+		ino, err := GetPidNsInode(1, n)
+		if err != nil {
+			// No support for time namespace
+			if (n == "time" || n == "time_for_children") && TimeNsSupport == false {
+				knownNamespaces[n] = &tetragon.Namespace{Inum: 0, IsHost: false}
+				continue
+			}
+			return nil, err
+		}
+		knownNamespaces[n] = &tetragon.Namespace{
+			Inum:   ino,
+			IsHost: true,
 		}
 	}
-	return hostNamespace
-}
 
-func createHostNs(ns string) *tetragon.Namespace {
-	return &tetragon.Namespace{
-		Inum:   GetPidNsInode(1, ns),
-		IsHost: true,
+	hostNamespaces = &tetragon.Namespaces{
+		Uts:             knownNamespaces["uts"],
+		Ipc:             knownNamespaces["ipc"],
+		Mnt:             knownNamespaces["mnt"],
+		Pid:             knownNamespaces["pid"],
+		PidForChildren:  knownNamespaces["pid_for_children"],
+		Net:             knownNamespaces["net"],
+		Time:            knownNamespaces["time"],
+		TimeForChildren: knownNamespaces["time_for_children"],
+		Cgroup:          knownNamespaces["cgroup"],
+		User:            knownNamespaces["user"],
 	}
+	return hostNamespaces, nil
 }
